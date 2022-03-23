@@ -355,12 +355,12 @@ class DataCollection(Iterable, AllMixins):
         return self.factory(result)
 
     @_private_wrapper
-    def map(self, *arg):
+    def map(self, op):
         """
         apply operator to data collection
 
         Args:
-            *arg (Callable): functions/operators to apply to data collection;
+            op (Callable or [Callable,...]): functions/operators to apply to data collection;
 
         Returns:
             DataCollection: data collections that contains computation results;
@@ -374,23 +374,23 @@ class DataCollection(Iterable, AllMixins):
 
         # return map(unary_op, self._iterable)
         # mmap
-        if len(arg) > 1:
-            return self.mmap(*arg)
-        unary_op = arg[0]
+        if isinstance(op, list):
+            return self.mmap(op)
 
         # pmap
         if self.get_executor() is not None:
-            return self.pmap(unary_op, executor=self._executor)
+            print('map -> pmap')
+            return self.pmap(op, executor=self._executor)
 
         #map
         def inner(x):
             try:
                 if isinstance(x, Option):
-                    return x.map(unary_op)
+                    return x.map(op)
                 else:
-                    return unary_op(x)
+                    return op(x)
             except Exception as e:  # pylint: disable=broad-except
-                engine_log.warning(f'{e}, please check {x} with op {unary_op}. Continue...')  # pylint: disable=logging-fstring-interpolation
+                engine_log.warning(f'{e}, please check {x} with op {op}. Continue...')  # pylint: disable=logging-fstring-interpolation
                 return Empty(x, e)
 
         return map(inner, self._iterable)
@@ -743,11 +743,6 @@ class DataCollection(Iterable, AllMixins):
             yield x
 
     def to_list(self):
-        print(self._iterable)
-        for x in self._iterable:
-            print(x)
-        for x in self:
-            print(x)
         return self._iterable if isinstance(self._iterable,
                                             list) else list(self)
 
