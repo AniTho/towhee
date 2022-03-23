@@ -16,7 +16,7 @@ from queue import Queue
 import asyncio
 
 from towhee.utils.log import engine_log
-from towhee.functional.option import Option, Empty
+from towhee.functional.option import Option, Empty, _Reason
 from towhee.hparam.hyperparameter import param_scope
 
 
@@ -30,6 +30,19 @@ def map_task(x, unary_op):
         except Exception as e:  # pylint: disable=broad-except
             engine_log.warning(f'{e}, please check {x} with op {unary_op}. Continue...')  # pylint: disable=logging-fstring-interpolation
             return Empty(x, e)
+
+    return map_wrapper
+
+def map_task_ray(unary_op):
+    def map_wrapper(x):
+        try:
+            if isinstance(x, Option):
+                return x.map(unary_op)
+            else:
+                return unary_op(x)
+        except Exception as e:  # pylint: disable=broad-except
+            engine_log.warning(f'{e}, please check {x} with op {unary_op}. Continue...')  # pylint: disable=logging-fstring-interpolation
+            return Empty(_Reason(x, e))
 
     return map_wrapper
 
@@ -54,9 +67,9 @@ class ParallelMixin:
             parent = hp().data_collection.parent(None)
         if parent is not None and hasattr(parent, '_executor') and isinstance(
                 parent._executor, concurrent.futures.ThreadPoolExecutor):
-            self.set_parallel(executor=parent._executor)
+            self.set_parallel(executor=parent._executor, backend=parent._backend)
 
-    def set_parallel(self, num_worker=None, executor=None):
+    def set_parallel(self, num_worker=None, executor=None, backend = None):
         """
         set parallel execution
 
@@ -77,12 +90,23 @@ class ParallelMixin:
             self._executor = executor
         if num_worker is not None:
             self._executor = concurrent.futures.ThreadPoolExecutor(num_worker)
+        if backend is not None:
+            self._backend = backend
+        else:
+            self._backend = 'thread'
+
         return self
+
 
     def get_executor(self):
         if hasattr(self, '_executor') and isinstance(
                 self._executor, concurrent.futures.ThreadPoolExecutor):
             return self._executor
+        return None
+
+    def get_backend(self):
+        if hasattr(self, '_backend'):
+            return self._backend
         return None
 
     def parallel(self, num_worker):
@@ -107,7 +131,18 @@ class ParallelMixin:
 
         return self.factory(inner())
 
-    def pmap(self, unary_op, num_worker=None, executor=None):
+    def pmap(self, unary_op, num_worker = None, executor = None, backend = None):
+        if backend is None:
+            if self.get_backend() == 'ray':
+                return self.ray_pmap(unary_op, num_worker, executor)
+            else:
+                return self.thread_pmap(unary_op, num_worker, executor)
+        elif backend == 'thread':
+            return self.thread_pmap(unary_op, num_worker, executor)
+        elif backend == 'ray':
+            return self.ray_pmap(unary_op, num_worker, executor)
+
+    def thread_pmap(self, unary_op, num_worker=None, executor=None):
         """
         apply `unary_op` with parallel execution
 
@@ -146,7 +181,7 @@ class ParallelMixin:
         def worker_wrapper():
             loop.run_until_complete(worker())
 
-        if executor is None:
+        if executor is None or num_worker is not None:
             executor = concurrent.futures.ThreadPoolExecutor(num_worker)
         num_worker = executor._max_workers  # pylint: disable=protected-access
         queue = Queue(maxsize=num_worker)
@@ -157,7 +192,121 @@ class ParallelMixin:
 
         return self.factory(inner())
 
-    def mmap(self, *arg):
+    def ray_pmap(self, unary_op, num_worker=None, executor=None):
+        """
+        apply `unary_op` with parallel execution
+
+        Examples:
+        >>> from towhee.functional import DataCollection
+        >>> import threading
+        >>> stage_1_thread_set = {threading.current_thread().ident}
+        >>> stage_2_thread_set = {threading.current_thread().ident}
+        >>> result = (
+        ...     DataCollection.range(1000).stream()
+        ...     .pmap(lambda x: stage_1_thread_set.add(threading.current_thread().ident), 5)
+        ...     .pmap(lambda x: stage_2_thread_set.add(threading.current_thread().ident), 4).to_list()
+        ... )
+        >>> len(stage_1_thread_set)
+        5
+        >>> len(stage_2_thread_set)
+        4
+        """
+        import ray
+        ###### ACTOR: Currently much slower
+
+        # @ray.remote
+        # class RemoteActor:
+        #     def remote_runner(self, val):
+        #         return map_task_ray(unary_op)(val)
+
+        # pool = ray.util.ActorPool([RemoteActor.remote() for _ in range(num_worker)])
+
+        # def inner():
+        #     nonlocal flag
+        #     while flag or not queue.empty():
+        #         yield queue.get()
+        #     # executor.shutdown()
+
+        # #TODO: Do chunk operations.
+        # async def worker():
+        #     count = 0
+        #     for x in self:
+        #         count += 1
+        #         pool.submit(lambda a, v: a.remote_runner.remote(v), x)
+        #         if pool.has_next():
+        #             queue.put(pool.get_next())
+        #             count -= 1
+        #     while count > 0:
+        #         queue.put(pool.get_next())
+        #         count -= 1
+        #     nonlocal flag
+        #     flag = False
+
+        # def worker_wrapper():
+        #     loop.run_until_complete(worker())
+
+        # if executor is None:
+        #     executor = concurrent.futures.ThreadPoolExecutor(num_worker)
+        # num_worker = executor._max_workers  # pylint: disable=protected-access
+        # queue = Queue(maxsize=num_worker)
+        # loop = asyncio.new_event_loop()
+        # flag = True
+
+        # executor.submit(worker_wrapper)
+
+
+        ###### TASK: Need a good way of transferring the model.
+
+        def inner():
+            nonlocal flag
+            while flag or not queue.empty():
+                yield queue.get()
+            # executor.shutdown()
+
+        @ray.remote
+        def remote_runner(val):
+            return map_task_ray(unary_op)(val)
+
+        #TODO: Do chunk operations.
+        async def worker():
+            buff = []
+            for x in self:
+                if len(buff) == num_worker:
+                    queue.put(await buff.pop(0))
+                buff.append(asyncio.wrap_future(remote_runner.remote(x).future()))
+            while len(buff) > 0:
+                queue.put(await buff.pop(0))
+            nonlocal flag
+            flag = False
+
+        def worker_wrapper():
+            loop.run_until_complete(worker())
+
+        if executor is None or num_worker is not None:
+            executor = concurrent.futures.ThreadPoolExecutor(num_worker)
+        num_worker = executor._max_workers  # pylint: disable=protected-access
+        queue = Queue(maxsize=num_worker)
+        loop = asyncio.new_event_loop()
+        flag = True
+
+        executor.submit(worker_wrapper)
+
+        return self.factory(inner())
+
+    def mmap(self, ops, num_worker = None, executor = None, backend = None):
+        if backend is None:
+            if self.get_backend() == 'ray':
+                return self.ray_mmap(ops=ops, num_worker=num_worker, executor=executor)
+            else:
+                return self.thread_mmap(ops=ops, num_worker=num_worker, executor=executor)
+        elif backend == 'thread':
+            return self.thread_mmap(ops=ops, num_worker=num_worker, executor=executor)
+        elif backend == 'ray':
+            return self.ray_mmap(ops=ops, num_worker=num_worker, executor=executor)
+
+
+    def thread_mmap(self, ops, num_worker = None, executor = None):
+        print('thread')
         """
         apply multiple unary_op to data collection.
 
@@ -192,17 +341,17 @@ class ParallelMixin:
                 yield queue.get()
 
         async def worker():
-            buffs = [[] for _ in arg]
+            buffs = [[] for _ in ops]
             for x in self:
-                for i in range(len(arg)):
+                for i in range(len(ops)):
                     queue = queues[i]
                     buff = buffs[i]
                     if len(buff) == num_worker:
                         queue.put(await buff.pop(0))
                     buff.append(
-                        loop.run_in_executor(executor, map_task(x, arg[i])))
+                        loop.run_in_executor(executor, map_task(x, ops[i])))
             while sum([len(buff) for buff in buffs]) > 0:
-                for i in range(len(arg)):
+                for i in range(len(ops)):
                     queue = queues[i]
                     buff = buffs[i]
                     queue.put(await buff.pop(0))
@@ -213,10 +362,90 @@ class ParallelMixin:
             loop.run_until_complete(worker())
 
         executor = self.get_executor()
-        if executor is None:
-            executor = concurrent.futures.ThreadPoolExecutor(len(arg))
-        num_worker = 1
-        queues = [Queue(maxsize=num_worker) for _ in arg]
+        if executor is None or num_worker is not None:
+            executor = concurrent.futures.ThreadPoolExecutor(num_worker)
+        task_num_worker = max(1, num_worker//len(ops))
+        queues = [Queue(maxsize=task_num_worker) for _ in ops]
+        loop = asyncio.new_event_loop()
+        flag = True
+
+        executor.submit(worker_wrapper)
+
+        retval = [inner(queue) for queue in queues]
+        return [self.factory(x) for x in retval]
+
+    def ray_mmap(self, ops, num_worker = None, executor = None):
+        print('ray')
+        """
+        apply multiple unary_op to data collection.
+
+        Examples:
+        1. using mmap
+        >>> from towhee.functional import DataCollection
+        >>> dc = DataCollection([0,1,2,'3',4]).stream()
+        >>> a, b = dc.mmap(lambda x: x+1, lambda x: x*2)
+        >>> c = a.map(lambda x: x+1)
+        >>> c.zip(b).to_list()
+        [(2, 0), (3, 2), (4, 4), (Empty(), '33'), (6, 8)]
+
+        2. using map instead of mmap
+        >>> from towhee.functional import DataCollection
+        >>> dc = DataCollection.range(5).stream()
+        >>> a, b, c = dc.map(lambda x: x+1, lambda x: x*2, lambda x: int(x/2))
+        >>> d = a.map(lambda x: x+1)
+        >>> d.zip(b, c).to_list()
+        [(2, 0, 0), (3, 2, 0), (4, 4, 1), (5, 6, 1), (6, 8, 2)]
+
+        3. dag execution
+        >>> dc = DataCollection.range(5).stream()
+        >>> a, b, c = dc.map(lambda x: x+1, lambda x: x*2, lambda x: int(x/2))
+        >>> d = a.map(lambda x: x+1)
+        >>> d.zip(b, c).map(lambda x: x[0]+x[1]+x[2]).to_list()
+        [2, 5, 9, 12, 16]
+        """
+        import ray
+
+        def inner(queue):
+            nonlocal flag
+            while flag or not queue.empty():
+                yield queue.get()
+
+        async def worker():
+            buffs = [[] for _ in ops]
+            for x in self:
+                for i in range(len(ops)):
+                    func = ops[i]
+
+                    # Need a way to declare func without passing in func
+                    # @ray.remote
+                    # def remote_runner(val, func = func):
+                    #     return map_task_ray(func)(val)
+                    @ray.remote
+                    def remote_runner(val):
+                        return map_task_ray(func)(val)
+
+                    queue = queues[i]
+                    buff = buffs[i]
+                    if len(buff) == num_worker:
+                        queue.put(await buff.pop(0))
+                    buff.append(
+                        asyncio.wrap_future(remote_runner.remote(x).future()))
+            while sum([len(buff) for buff in buffs]) > 0:
+                for i in range(len(ops)):
+                    queue = queues[i]
+                    buff = buffs[i]
+                    queue.put(await buff.pop(0))
+            nonlocal flag
+            flag = False
+
+        def worker_wrapper():
+            loop.run_until_complete(worker())
+
+        executor = self.get_executor()
+        if executor is None or num_worker is not None:
+            executor = concurrent.futures.ThreadPoolExecutor(num_worker)
+        task_num_worker = max(1, num_worker//len(ops))
+        queues = [Queue(maxsize=task_num_worker) for _ in ops]
         loop = asyncio.new_event_loop()
         flag = True
 
