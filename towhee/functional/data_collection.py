@@ -743,6 +743,11 @@ class DataCollection(Iterable, AllMixins):
             yield x
 
     def to_list(self):
+        print(self._iterable)
+        for x in self._iterable:
+            print(x)
+        for x in self:
+            print(x)
         return self._iterable if isinstance(self._iterable,
                                             list) else list(self)
 

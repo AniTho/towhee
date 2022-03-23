@@ -143,6 +143,7 @@ class ParallelMixin:
             return self.ray_pmap(unary_op, num_worker, executor)
 
     def thread_pmap(self, unary_op, num_worker=None, executor=None):
+        print('thread_pmap')
         """
         apply `unary_op` with parallel execution
 
@@ -193,6 +194,7 @@ class ParallelMixin:
         return self.factory(inner())
 
     def ray_pmap(self, unary_op, num_worker=None, executor=None):
+        print('ray_pmap')
         """
         apply `unary_op` with parallel execution
 
@@ -294,6 +296,10 @@ class ParallelMixin:
         return self.factory(inner())
 
     def mmap(self, ops, num_worker = None, executor = None, backend = None):
+        if len(ops) == 1:
+            print('print sending pmap')
+            print(ops[0])
+            return self.pmap(unary_op=ops[0], num_worker=num_worker, executor=executor, backend=backend)
         if backend is None:
             if self.get_backend() == 'ray':
                 return self.ray_mmap(ops=ops, num_worker=num_worker, executor=executor)
@@ -306,7 +312,7 @@ class ParallelMixin:
 
 
     def thread_mmap(self, ops, num_worker = None, executor = None):
-        print('thread')
+        print('thread_mmap')
         """
         apply multiple unary_op to data collection.
 
@@ -334,6 +340,7 @@ class ParallelMixin:
         >>> d.zip(b, c).map(lambda x: x[0]+x[1]+x[2]).to_list()
         [2, 5, 9, 12, 16]
         """
+        print('ops:',ops)
 
         def inner(queue):
             nonlocal flag
@@ -346,7 +353,7 @@ class ParallelMixin:
                 for i in range(len(ops)):
                     queue = queues[i]
                     buff = buffs[i]
-                    if len(buff) == num_worker:
+                    if len(buff) == task_num_worker:
                         queue.put(await buff.pop(0))
                     buff.append(
                         loop.run_in_executor(executor, map_task(x, ops[i])))
@@ -355,6 +362,7 @@ class ParallelMixin:
                     queue = queues[i]
                     buff = buffs[i]
                     queue.put(await buff.pop(0))
+
             nonlocal flag
             flag = False
 
@@ -364,6 +372,10 @@ class ParallelMixin:
         executor = self.get_executor()
         if executor is None or num_worker is not None:
             executor = concurrent.futures.ThreadPoolExecutor(num_worker)
+        
+        if num_worker is None:
+            num_worker = 1
+
         task_num_worker = max(1, num_worker//len(ops))
         queues = [Queue(maxsize=task_num_worker) for _ in ops]
         loop = asyncio.new_event_loop()
@@ -372,10 +384,11 @@ class ParallelMixin:
         executor.submit(worker_wrapper)
 
         retval = [inner(queue) for queue in queues]
+        print('retval:', retval)
         return [self.factory(x) for x in retval]
 
     def ray_mmap(self, ops, num_worker = None, executor = None):
-        print('ray')
+        print('ray_mmap')
         """
         apply multiple unary_op to data collection.
 
@@ -444,6 +457,8 @@ class ParallelMixin:
         executor = self.get_executor()
         if executor is None or num_worker is not None:
             executor = concurrent.futures.ThreadPoolExecutor(num_worker)
+        if num_worker is None:
+            num_worker = 1
         task_num_worker = max(1, num_worker//len(ops))
         queues = [Queue(maxsize=task_num_worker) for _ in ops]
         loop = asyncio.new_event_loop()
